@@ -3688,6 +3688,121 @@ class TestRunConversation:
             "kanban_block should not be called outside kanban mode"
         )
 
+    def test_reaction_only_turn_completes_without_nudge(self, agent):
+        """A successful reaction (discord react_to_message) followed by an
+        empty assistant response is an INTENTIONAL, complete turn: the loop
+        must not nudge, retry, or switch fallback, and must report
+        turn_exit_reason='terminal_ack_tool' with an empty final response.
+        """
+        self._setup_agent(agent)
+        agent.max_iterations = 10
+        agent.valid_tool_names = set(agent.valid_tool_names) | {"discord"}
+
+        react = _mock_tool_call(
+            name="discord",
+            arguments=(
+                '{"action": "react_to_message", "channel_id": "1", '
+                '"message_id": "2", "emoji": "✅"}'
+            ),
+            call_id="r1",
+        )
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[react])
+        resp2 = _mock_response(content="", finish_reason="stop")  # empty follow-up
+        # A third response is only consumed if the loop WRONGLY nudges/retries.
+        guard = _mock_response(content="SHOULD NOT BE USED", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, guard]
+
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                return_value='{"success": true, "message": "Reacted with ✅."}',
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("remind me to water the plants")
+
+        assert agent._reaction_emitted_this_turn is True
+        assert result["turn_exit_reason"] == "terminal_ack_tool"
+        assert result["final_response"] == ""
+        assert result["completed"] is True
+        assert result["failed"] is False
+        # Exactly two API calls (react + empty follow-up). A third call
+        # would mean the post-tool nudge / empty-retry fired.
+        assert agent.client.chat.completions.create.call_count == 2
+
+    def test_empty_without_reaction_still_nudges(self, agent):
+        """An empty follow-up after a NON-reaction tool must still trigger
+        the post-tool nudge (the existing safety net is preserved)."""
+        self._setup_agent(agent)
+        agent.max_iterations = 10
+
+        search = _mock_tool_call(name="web_search", arguments="{}", call_id="s1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[search])
+        resp2 = _mock_response(content="", finish_reason="stop")  # empty → must nudge
+        resp3 = _mock_response(content="Here is the answer.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("look something up")
+
+        assert agent._reaction_emitted_this_turn is False
+        assert result["final_response"] == "Here is the answer."
+        assert result["turn_exit_reason"] != "terminal_ack_tool"
+        # Three API calls: tool round, empty (nudged), recovered answer.
+        assert agent.client.chat.completions.create.call_count == 3
+
+
+class TestReactionTerminalAck:
+    """Unit tests for the reaction terminal-ack detection helpers used by the
+    tool executor to set ``agent._reaction_emitted_this_turn``."""
+
+    def test_is_reaction_tool_call_discord_react(self):
+        from agent.tool_executor import _is_reaction_tool_call
+        assert _is_reaction_tool_call(
+            "discord", {"action": "react_to_message", "emoji": "✅"}
+        ) is True
+
+    def test_is_reaction_tool_call_discord_other_action(self):
+        from agent.tool_executor import _is_reaction_tool_call
+        assert _is_reaction_tool_call("discord", {"action": "fetch_messages"}) is False
+
+    def test_is_reaction_tool_call_non_reaction_tool(self):
+        from agent.tool_executor import _is_reaction_tool_call
+        assert _is_reaction_tool_call("web_search", {"action": "react_to_message"}) is False
+
+    def test_is_reaction_tool_call_non_dict_args(self):
+        from agent.tool_executor import _is_reaction_tool_call
+        assert _is_reaction_tool_call("discord", None) is False
+
+    def test_mark_sets_flag_on_successful_reaction(self):
+        from agent.tool_executor import _mark_reaction_if_emitted
+        agent = SimpleNamespace()
+        _mark_reaction_if_emitted(
+            agent, "discord", {"action": "react_to_message"}, is_error=False
+        )
+        assert agent._reaction_emitted_this_turn is True
+
+    def test_mark_noop_when_reaction_failed(self):
+        from agent.tool_executor import _mark_reaction_if_emitted
+        agent = SimpleNamespace()
+        _mark_reaction_if_emitted(
+            agent, "discord", {"action": "react_to_message"}, is_error=True
+        )
+        assert getattr(agent, "_reaction_emitted_this_turn", False) is False
+
+    def test_mark_noop_for_non_reaction_tool(self):
+        from agent.tool_executor import _mark_reaction_if_emitted
+        agent = SimpleNamespace()
+        _mark_reaction_if_emitted(agent, "web_search", {"q": "x"}, is_error=False)
+        assert getattr(agent, "_reaction_emitted_this_turn", False) is False
+
 
 class TestRetryExhaustion:
     """Regression: retry_count > max_retries was dead code (off-by-one).

@@ -417,6 +417,45 @@ class TestGatewaySurfacesNullResponse:
 
         assert result == "Hello!"
 
+    def test_terminal_ack_tool_stays_silent(self):
+        """Intentionally-silent reaction turns (turn_exit_reason=
+        terminal_ack_tool) must NOT be turned into a 'no response generated'
+        message — empty text is the correct, complete outcome."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": "",
+            "api_calls": 2,
+            "completed": True,
+            "turn_exit_reason": "terminal_ack_tool",
+        }
+
+        response = agent_result.get("final_response") or ""
+        result = _normalize_empty_agent_response(
+            agent_result, response, history_len=10,
+        )
+
+        assert result == "", "Reaction-only turns must stay empty (no synthetic text)"
+
+    def test_empty_turn_without_terminal_ack_is_surfaced(self):
+        """Without the terminal_ack signal, an empty turn that did work still
+        surfaces the catch-all warning (safety net unchanged)."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": "",
+            "api_calls": 2,
+            "completed": True,
+        }
+
+        response = agent_result.get("final_response") or ""
+        result = _normalize_empty_agent_response(
+            agent_result, response, history_len=10,
+        )
+
+        assert result != "", "Empty turn with no terminal-ack must be surfaced"
+        assert "no response" in result.lower()
+
 
 # ===========================================================================
 # Prune: finalize_orphaned_compression_sessions

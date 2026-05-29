@@ -455,6 +455,11 @@ def run_conversation(
     agent._codex_incomplete_retries = 0
     agent._thinking_prefill_retries = 0
     agent._post_tool_empty_retried = False
+    # True once a reaction (e.g. discord react_to_message) succeeded this
+    # turn — set in agent.tool_executor.  Lets an empty assistant follow-up
+    # count as an intentional, complete "terminal-ack" turn (no nudge,
+    # retry, or fallback) instead of being treated as a stall.
+    agent._reaction_emitted_this_turn = False
     agent._last_content_with_tools = None
     agent._last_content_tools_all_housekeeping = False
     agent._mute_post_response = False
@@ -3965,37 +3970,31 @@ def run_conversation(
                         agent._response_was_previewed = True
                         break
 
-                    # ── Terminal-acknowledgement tool calls ───────────
-                    # Some tool calls are themselves the response — most
-                    # notably `discord(action=react_to_message)`, which
-                    # drops an emoji reaction on the user's message in
-                    # place of typing a text reply. Empty assistant
-                    # content after such a call is intentional, not a
-                    # stall; exit cleanly with an empty final response
-                    # instead of nudging the model to "continue".
-                    def _is_terminal_ack_call(tc) -> bool:
-                        try:
-                            if tc.function.name != "discord":
-                                return False
-                            import json as _json
-                            raw_args = tc.function.arguments
-                            if isinstance(raw_args, str):
-                                args = _json.loads(raw_args or "{}")
-                            else:
-                                args = raw_args or {}
-                            return args.get("action") == "react_to_message"
-                        except Exception:
-                            return False
-
-                    _all_terminal_ack = bool(assistant_message.tool_calls) and all(
-                        _is_terminal_ack_call(tc)
-                        for tc in assistant_message.tool_calls
-                    )
-                    if _all_terminal_ack:
+                    # ── Terminal-acknowledgement (reaction) turns ─────
+                    # Some tool calls ARE the response — most notably
+                    # `discord(action=react_to_message)`, which drops an
+                    # emoji reaction on the user's message in place of a
+                    # text reply.  When such a reaction succeeded anywhere
+                    # in THIS turn (the tool ran in an earlier round and
+                    # this follow-up came back empty), the empty assistant
+                    # content is intentional, not a stall — exit cleanly
+                    # with an empty final response instead of nudging,
+                    # retrying, or switching providers.
+                    #
+                    # The signal is set in agent.tool_executor when the
+                    # reaction call succeeds (covers both the sequential
+                    # and concurrent execution paths); the tool functions
+                    # themselves are pure and have no agent handle.  The
+                    # "terminal_ack_tool" exit reason is consumed by
+                    # gateway.run._normalize_empty_agent_response so the
+                    # empty turn is delivered silently rather than as a
+                    # "no response generated" error.
+                    if getattr(agent, "_reaction_emitted_this_turn", False):
                         _turn_exit_reason = "terminal_ack_tool"
                         logger.info(
-                            "Empty response after terminal-ack tool call "
-                            "(e.g. discord react_to_message) — exiting cleanly"
+                            "Empty response after a reaction was emitted "
+                            "this turn (e.g. discord react_to_message) — "
+                            "exiting cleanly"
                         )
                         final_response = ""
                         agent._response_was_previewed = True
