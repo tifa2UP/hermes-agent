@@ -454,6 +454,30 @@ def _create_thread(
     })
 
 
+def _react_to_message(
+    token: str, channel_id: str, message_id: str, emoji: str, **_kwargs: Any,
+) -> str:
+    """Add an emoji reaction to a message as the bot user.
+
+    ``emoji`` is the Unicode glyph (e.g. ``👍``) or a custom emoji in the
+    format ``name:id``. Unicode is URL-encoded automatically.
+    """
+    if not emoji:
+        return json.dumps({"error": "react_to_message requires an 'emoji' parameter."})
+    # Discord expects the emoji in the URL. Unicode chars must be percent-
+    # encoded; custom emoji are passed as ``name:id``.
+    encoded = urllib.parse.quote(emoji, safe=":")
+    _discord_request(
+        "PUT",
+        f"/channels/{channel_id}/messages/{message_id}/reactions/{encoded}/@me",
+        token,
+    )
+    return json.dumps({
+        "success": True,
+        "message": f"Reacted with {emoji} on message {message_id}.",
+    })
+
+
 def _add_role(token: str, guild_id: str, user_id: str, role_id: str, **_kwargs: Any) -> str:
     """Add a role to a guild member."""
     _discord_request("PUT", f"/guilds/{guild_id}/members/{user_id}/roles/{role_id}", token)
@@ -483,12 +507,13 @@ _ACTIONS = {
     "pin_message": _pin_message,
     "unpin_message": _unpin_message,
     "delete_message": _delete_message,
+    "react_to_message": _react_to_message,
     "create_thread": _create_thread,
     "add_role": _add_role,
     "remove_role": _remove_role,
 }
 
-_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread"})
+_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread", "react_to_message"})
 _ADMIN_ACTION_NAMES = frozenset(_ACTIONS.keys()) - _CORE_ACTION_NAMES
 
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
@@ -510,6 +535,7 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("pin_message", "(channel_id, message_id)", "pin a message"),
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
     ("delete_message", "(channel_id, message_id)", "delete a message"),
+    ("react_to_message", "(channel_id, message_id, emoji)", "add a reaction emoji as the bot user"),
     ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor"),
     ("add_role", "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", "(guild_id, user_id, role_id)", "remove a role"),
@@ -531,6 +557,7 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
     "pin_message": ["channel_id", "message_id"],
     "unpin_message": ["channel_id", "message_id"],
     "delete_message": ["channel_id", "message_id"],
+    "react_to_message": ["channel_id", "message_id", "emoji"],
     "create_thread": ["channel_id", "name"],
     "add_role": ["guild_id", "user_id", "role_id"],
     "remove_role": ["guild_id", "user_id", "role_id"],
@@ -693,6 +720,10 @@ def _build_schema(
             "type": "string",
             "description": "New thread name (create_thread).",
         },
+        "emoji": {
+            "type": "string",
+            "description": "Reaction emoji (react_to_message). Unicode glyph (e.g. '👍') or custom emoji as 'name:id'.",
+        },
         "limit": {
             "type": "integer",
             "minimum": 1,
@@ -835,6 +866,7 @@ def _run_discord_action(
     message_id: str = "",
     query: str = "",
     name: str = "",
+    emoji: str = "",
     limit: int = 50,
     before: str = "",
     after: str = "",
@@ -872,6 +904,7 @@ def _run_discord_action(
         "message_id": message_id,
         "query": query,
         "name": name,
+        "emoji": emoji,
     }
 
     missing = [p for p in _REQUIRED_PARAMS.get(action, []) if not local_vars.get(p)]
@@ -890,6 +923,7 @@ def _run_discord_action(
             message_id=message_id,
             query=query,
             name=name,
+            emoji=emoji,
             limit=limit,
             before=before,
             after=after,
@@ -921,7 +955,7 @@ def discord_admin_handler(action: str, **kwargs) -> str:
 
 _HANDLER_DEFAULTS = {
     "action": "", "guild_id": "", "channel_id": "", "user_id": "",
-    "role_id": "", "message_id": "", "query": "", "name": "",
+    "role_id": "", "message_id": "", "query": "", "name": "", "emoji": "",
     "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440,
 }
 

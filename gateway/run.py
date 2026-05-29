@@ -1575,6 +1575,12 @@ def _normalize_empty_agent_response(
     if response:
         return response
 
+    # Intentionally-silent turns: the assistant performed a "terminal
+    # acknowledgement" tool call (e.g. discord react_to_message) where the
+    # tool IS the user-facing response. Empty text is correct, not a stall.
+    if agent_result.get("turn_exit_reason") == "terminal_ack_tool":
+        return ""
+
     if agent_result.get("failed"):
         error_detail = agent_result.get("error", "unknown error")
         error_str = str(error_detail).lower()

@@ -3965,6 +3965,43 @@ def run_conversation(
                         agent._response_was_previewed = True
                         break
 
+                    # ── Terminal-acknowledgement tool calls ───────────
+                    # Some tool calls are themselves the response — most
+                    # notably `discord(action=react_to_message)`, which
+                    # drops an emoji reaction on the user's message in
+                    # place of typing a text reply. Empty assistant
+                    # content after such a call is intentional, not a
+                    # stall; exit cleanly with an empty final response
+                    # instead of nudging the model to "continue".
+                    def _is_terminal_ack_call(tc) -> bool:
+                        try:
+                            if tc.function.name != "discord":
+                                return False
+                            import json as _json
+                            raw_args = tc.function.arguments
+                            if isinstance(raw_args, str):
+                                args = _json.loads(raw_args or "{}")
+                            else:
+                                args = raw_args or {}
+                            return args.get("action") == "react_to_message"
+                        except Exception:
+                            return False
+
+                    _all_terminal_ack = bool(assistant_message.tool_calls) and all(
+                        _is_terminal_ack_call(tc)
+                        for tc in assistant_message.tool_calls
+                    )
+                    if _all_terminal_ack:
+                        _turn_exit_reason = "terminal_ack_tool"
+                        logger.info(
+                            "Empty response after terminal-ack tool call "
+                            "(e.g. discord react_to_message) — exiting cleanly"
+                        )
+                        final_response = ""
+                        agent._response_was_previewed = True
+                        agent._empty_content_retries = 0
+                        break
+
                     # ── Post-tool-call empty response nudge ───────────
                     # The model returned empty after executing tool calls.
                     # This covers two cases:

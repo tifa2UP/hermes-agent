@@ -1324,7 +1324,25 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
 
     try:
         from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
-        client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0)
+
+        # Azure OpenAI branch: when stt.openai.azure_endpoint is configured,
+        # use AzureOpenAI which knows the /openai/deployments/<model>/...
+        # URL shape and api-key header. The "model" arg becomes the
+        # deployment name (Azure convention).
+        _stt_cfg = _load_stt_config().get("openai", {})
+        _azure_endpoint = _stt_cfg.get("azure_endpoint", "")
+        if _azure_endpoint:
+            from openai import AzureOpenAI
+            _api_version = _stt_cfg.get("api_version", "2024-06-01")
+            client = AzureOpenAI(
+                api_key=api_key,
+                azure_endpoint=_azure_endpoint,
+                api_version=_api_version,
+                timeout=30,
+                max_retries=0,
+            )
+        else:
+            client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0)
         try:
             with open(file_path, "rb") as audio_file:
                 transcription = client.audio.transcriptions.create(
@@ -1631,17 +1649,30 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
 
 
 def _resolve_openai_audio_client_config() -> tuple[str, str]:
-    """Return direct OpenAI audio config or a managed gateway fallback."""
+    """Return direct OpenAI audio config or a managed gateway fallback.
+
+    Also surfaces Azure-OpenAI config: when ``stt.openai.azure_endpoint`` is
+    set, the returned ``base_url`` is the Azure endpoint and the caller
+    must instantiate ``AzureOpenAI`` instead of ``OpenAI`` (see
+    :func:`_transcribe_openai`).  We don't add a second return slot so the
+    legacy callers stay source-compatible; the Azure path is detected by
+    re-reading ``_load_stt_config()`` at use time.
+    """
     stt_config = _load_stt_config()
     openai_cfg = stt_config.get("openai", {})
     cfg_api_key = openai_cfg.get("api_key", "")
     cfg_base_url = openai_cfg.get("base_url", "")
+    cfg_azure_endpoint = openai_cfg.get("azure_endpoint", "")
     if cfg_api_key:
-        return cfg_api_key, (cfg_base_url or OPENAI_BASE_URL)
+        # Azure path: use azure_endpoint as the surfaced "base_url" so callers
+        # that route on it (e.g. _transcribe_openai) detect Azure and switch
+        # to the AzureOpenAI client.
+        return cfg_api_key, (cfg_azure_endpoint or cfg_base_url or OPENAI_BASE_URL)
 
     direct_api_key = resolve_openai_audio_api_key()
     if direct_api_key:
-        return direct_api_key, OPENAI_BASE_URL
+        # Honor azure_endpoint even when the key came from env vars.
+        return direct_api_key, (cfg_azure_endpoint or OPENAI_BASE_URL)
 
     managed_gateway = resolve_managed_tool_gateway("openai-audio")
     if managed_gateway is None:

@@ -75,17 +75,20 @@ ADAPTIVE_EFFORT_MAP = {
 
 # Models that accept the "xhigh" output_config.effort level.  Opus 4.7 added
 # xhigh as a distinct level between high and max; older adaptive-thinking
-# models (4.6) reject it with a 400.  Keep this substring list in sync with
-# the Anthropic migration guide as new model families ship.
+# models (4.6) reject it with a 400.  Opus 4.8 retains xhigh.  Keep this
+# substring list in sync with the Anthropic migration guide as new model
+# families ship.
 _XHIGH_EFFORT_SUBSTRINGS = ("4-7", "4.7", "4-8", "4.8")
 
 # Models where extended thinking is deprecated/removed (4.6+ behavior: adaptive
-# is the only supported mode; 4.7 additionally forbids manual thinking entirely
-# and drops temperature/top_p/top_k).
+# is the only supported mode; 4.7 and 4.8 additionally forbid manual thinking
+# entirely (`thinking.type: "enabled"` is rejected with HTTP 400) and drop
+# temperature/top_p/top_k).
 _ADAPTIVE_THINKING_SUBSTRINGS = ("4-6", "4.6", "4-7", "4.7", "4-8", "4.8")
 
 # Models where temperature/top_p/top_k return 400 if set to non-default values.
-# This is the Opus 4.7 contract; future 4.x+ models are expected to follow it.
+# Established by the Opus 4.7 contract and carried forward to Opus 4.8; future
+# 4.x+ models are expected to follow it.
 _NO_SAMPLING_PARAMS_SUBSTRINGS = ("4-7", "4.7", "4-8", "4.8")
 _FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
 
