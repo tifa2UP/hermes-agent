@@ -111,6 +111,41 @@ async def test_process_message_background_adds_and_swaps_reactions(adapter):
 
 
 @pytest.mark.asyncio
+async def test_reaction_only_empty_turn_is_success_without_text_send(adapter):
+    """An empty (reaction-only) agent turn must be delivered cleanly: the
+    gateway sends NO text message and reports SUCCESS, so the lifecycle
+    swaps 👀→✅ (never ❌). This is the intentional 'remind me to X →
+    just react' outcome."""
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+
+    async def handler(_event):
+        await asyncio.sleep(0)
+        return ""  # agent acknowledged via a reaction tool; no text reply
+
+    async def hold_typing(_chat_id, interval=2.0, metadata=None):
+        await asyncio.Event().wait()
+
+    adapter.set_message_handler(handler)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="999"))
+    adapter._keep_typing = hold_typing
+
+    event = _make_event("8", raw_message)
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    # No text message is sent for an empty, intentional turn.
+    adapter.send.assert_not_awaited()
+    # 👀 on start → removed on complete → ✅ (SUCCESS), never ❌ (FAILURE).
+    assert raw_message.add_reaction.await_args_list[0].args == ("👀",)
+    assert raw_message.remove_reaction.await_args_list[0].args == ("👀", adapter._client.user)
+    assert raw_message.add_reaction.await_args_list[1].args == ("✅",)
+    added = [c.args for c in raw_message.add_reaction.await_args_list]
+    assert ("❌",) not in added
+
+
+@pytest.mark.asyncio
 async def test_interaction_backed_events_do_not_attempt_reactions(adapter):
     interaction = SimpleNamespace(guild_id=123456789)
 

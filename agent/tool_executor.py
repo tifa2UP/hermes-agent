@@ -62,6 +62,47 @@ def _ra():
     return run_agent
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Terminal-acknowledgement (reaction) detection
+# ──────────────────────────────────────────────────────────────────────
+# A handful of tool calls ARE the user-facing response: a platform
+# reaction (emoji) dropped on the user's message in place of a text reply.
+# When one SUCCEEDS, the turn is intentionally complete even if the model
+# then returns empty assistant text — so the conversation loop must not
+# nudge/retry/fall back.  It reads ``agent._reaction_emitted_this_turn``
+# (see agent.conversation_loop's empty-response handling).
+#
+# The tool functions themselves are pure (no agent handle), so the signal
+# is recorded here: the single point where both execution paths have an
+# agent handle AND the call's success/failure.  Extend the map as other
+# platforms gain reaction tools (Slack, Telegram, ...).
+_REACTION_TOOL_ACTIONS = {
+    "discord": frozenset({"react_to_message"}),
+    "discord_admin": frozenset({"react_to_message"}),
+}
+
+
+def _is_reaction_tool_call(function_name: str, function_args: Any) -> bool:
+    """Return True for a platform reaction call (e.g. discord react_to_message)."""
+    actions = _REACTION_TOOL_ACTIONS.get(function_name)
+    if not actions or not isinstance(function_args, dict):
+        return False
+    return function_args.get("action") in actions
+
+
+def _mark_reaction_if_emitted(agent, function_name: str, function_args: Any, is_error: bool) -> None:
+    """Flag a SUCCESSFUL reaction tool call as this turn's terminal-ack.
+
+    No-op for failed calls or non-reaction tools: a failed reaction leaves
+    the user with no acknowledgement, so an empty turn there should still
+    trigger the normal empty-response recovery.
+    """
+    if is_error:
+        return
+    if _is_reaction_tool_call(function_name, function_args):
+        agent._reaction_emitted_this_turn = True
+
+
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
@@ -252,6 +293,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         else:
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
         results[index] = (function_name, function_args, result, duration, is_error, False)
+        # A successful reaction (e.g. discord react_to_message) IS the
+        # turn's response — record it so an empty follow-up isn't nudged.
+        _mark_reaction_if_emitted(agent, function_name, function_args, is_error)
         # Tear down worker-tid tracking.  Clear any interrupt bit we may
         # have set so the next task scheduled onto this recycled tid
         # starts with a clean slate.
@@ -791,6 +835,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        # A successful reaction (e.g. discord react_to_message) IS the
+        # turn's response — record it so an empty follow-up isn't nudged.
+        _mark_reaction_if_emitted(agent, function_name, function_args, _is_error_result)
         if not _execution_blocked:
             function_result = agent._append_guardrail_observation(
                 function_name,
