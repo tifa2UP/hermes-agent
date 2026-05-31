@@ -4534,6 +4534,30 @@ def run_conversation(
             last_reasoning = msg["reasoning"]
             break
 
+    # ── Reaction-only acknowledgement (uniform override) ─────────────
+    # When a platform reaction (e.g. discord react_to_message) succeeded
+    # anywhere in THIS turn, that reaction IS the entire user-facing
+    # response.  The model frequently ALSO writes a redundant text reply
+    # ("Done — reminder set for 5 minutes"); delivering that text on top
+    # of the reaction is noise.  Blank the DELIVERED final_response and
+    # mark the turn as a terminal ack so gateway.run
+    # ._normalize_empty_agent_response delivers "" silently (and the
+    # gateway deletes any already-streamed text message).  This mirrors
+    # the empty-text case handled inline above (search
+    # "terminal_ack_tool") and unifies it for the non-empty-text case.
+    # The model's text stays in the conversation history (persisted
+    # already) — only the delivered response is suppressed.
+    if getattr(agent, "_reaction_emitted_this_turn", False):
+        if final_response:
+            logger.info(
+                "Reaction emitted this turn — suppressing redundant text "
+                "response (%d chars) so only the reaction is delivered",
+                len(final_response),
+            )
+        final_response = ""
+        _turn_exit_reason = "terminal_ack_tool"
+        agent._response_was_previewed = True
+
     # Build result with interrupt info if applicable
     result = {
         "final_response": final_response,
