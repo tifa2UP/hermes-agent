@@ -17276,6 +17276,12 @@ class GatewayRunner:
                     "interrupted": result.get("interrupted", False),
                     "interrupt_message": result.get("interrupt_message"),
                     "error": result.get("error"),
+                    # Propagate the agent's turn-exit reason so the delivery
+                    # layer (_normalize_empty_agent_response) can tell an
+                    # intentional silent turn ("terminal_ack_tool", e.g. a
+                    # discord reaction) apart from a genuine empty-response
+                    # error.  Without this the silent-ack path never fires.
+                    "turn_exit_reason": result.get("turn_exit_reason"),
                     "compression_exhausted": result.get("compression_exhausted", False),
                     "tools": tools_holder[0] or [],
                     "history_offset": len(agent_history),
@@ -17437,6 +17443,10 @@ class GatewayRunner:
                 "partial": result_holder[0].get("partial", False) if result_holder[0] else False,
                 "error": result_holder[0].get("error") if result_holder[0] else None,
                 "interrupt_message": result_holder[0].get("interrupt_message") if result_holder[0] else None,
+                # Propagate the agent's turn-exit reason so the delivery layer
+                # (_normalize_empty_agent_response) can recognise intentional
+                # silent turns ("terminal_ack_tool", e.g. a discord reaction).
+                "turn_exit_reason": result_holder[0].get("turn_exit_reason") if result_holder[0] else None,
                 "tools": tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
                 "last_prompt_tokens": _last_prompt_toks,
@@ -18100,6 +18110,40 @@ class GatewayRunner:
                         await task
                     except asyncio.CancelledError:
                         pass
+
+        # ── Reaction-only acknowledgement: discard streamed text ─────────
+        # When a platform reaction (e.g. discord react_to_message) succeeded
+        # this turn, the reaction IS the entire user-facing response.  The
+        # agent already blanked final_response (turn_exit_reason
+        # "terminal_ack_tool"), but because Discord streams, the model's now-
+        # suppressed text may have ALREADY been streamed into a real message
+        # before the turn ended.  Delete that message so the user sees ONLY
+        # the reaction.  Done here — in the outer async body, AFTER the
+        # stream task finished writing (awaited in the finally above) — so we
+        # never race the consumer.  Best-effort; never blocks delivery.
+        _reaction_agent = agent_holder[0]
+        if (
+            getattr(_reaction_agent, "_reaction_emitted_this_turn", False)
+            and stream_consumer_holder
+            and stream_consumer_holder[0] is not None
+        ):
+            _discard_sc = stream_consumer_holder[0]
+            # Only bother if the consumer actually sent/edited a message.
+            if getattr(_discard_sc, "message_id", None) or getattr(
+                _discard_sc, "_already_sent", False
+            ):
+                try:
+                    await _discard_sc.discard_sent()
+                    logger.info(
+                        "Reaction emitted this turn for session %s — discarded "
+                        "streamed text message so only the reaction is shown.",
+                        session_key or "?",
+                    )
+                except Exception as _discard_err:
+                    logger.debug(
+                        "discard_sent() after reaction failed for session %s: %s",
+                        session_key or "?", _discard_err,
+                    )
 
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).

@@ -182,6 +182,13 @@ class GatewayStreamConsumer:
         # this response and route through edit-based for graceful degradation.
         self._draft_failures = 0
 
+        # Set by discard_sent() when the streamed text has been deleted
+        # because a platform reaction (e.g. discord react_to_message) became
+        # the entire user-facing response this turn.  Once True, all send
+        # paths (on_delta / on_commentary / finish) no-op so a late delta
+        # can't re-create the text the gateway just deleted.
+        self._suppressed = False
+
     @property
     def already_sent(self) -> bool:
         """True if at least one message was sent or edited during the run."""
@@ -238,6 +245,8 @@ class GatewayStreamConsumer:
 
     def on_commentary(self, text: str) -> None:
         """Queue a completed interim assistant commentary message."""
+        if self._suppressed:
+            return
         if text:
             self._queue.put((_COMMENTARY, text))
 
@@ -278,6 +287,8 @@ class GatewayStreamConsumer:
         is finalized and subsequent text will be sent as a new message so it
         appears below any tool-progress messages the gateway sent in between.
         """
+        if self._suppressed:
+            return
         if text:
             self._queue.put(text)
         elif text is None:
@@ -285,7 +296,43 @@ class GatewayStreamConsumer:
 
     def finish(self) -> None:
         """Signal that the stream is complete."""
+        if self._suppressed:
+            return
         self._queue.put(_DONE)
+
+    async def discard_sent(self) -> None:
+        """Delete the already-streamed message and suppress further sends.
+
+        Called by the gateway when a platform reaction (e.g. discord
+        ``react_to_message``) became the entire user-facing response this
+        turn.  Any text the model also streamed has already landed in a real
+        message; this best-effort deletes it so the user sees only the
+        reaction, then resets send-state and latches ``_suppressed`` so a
+        late delta can't re-create the text we just removed.
+
+        Best-effort: platforms without ``delete_message`` (or where the
+        delete fails) simply keep the message — failures are logged at debug
+        and never raised.  Mirrors the fallback-cleanup delete pattern used
+        elsewhere in this consumer.
+        """
+        message_id = self._message_id
+        if message_id and message_id != "__no_edit__":
+            delete_fn = getattr(self.adapter, "delete_message", None)
+            if delete_fn is not None:
+                try:
+                    await delete_fn(self.chat_id, message_id)
+                except Exception as e:
+                    logger.debug(
+                        "discard_sent cleanup failed (%s): %s",
+                        message_id, e,
+                    )
+        # Reset send-state so no downstream code resends the suppressed text,
+        # and latch suppression so any queued/late delta no-ops.
+        self._message_id = None
+        self._already_sent = False
+        self._final_response_sent = False
+        self._final_content_delivered = False
+        self._suppressed = True
 
     # ── Think-block filtering ────────────────────────────────────────
     # Models like MiniMax emit inline <think>...</think> blocks in their

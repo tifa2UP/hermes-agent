@@ -3732,6 +3732,50 @@ class TestRunConversation:
         # would mean the post-tool nudge / empty-retry fired.
         assert agent.client.chat.completions.create.call_count == 2
 
+    def test_reaction_with_nonempty_text_suppresses_text(self, agent):
+        """When a reaction succeeded this turn AND the model ALSO produced a
+        non-empty text reply, the delivered final_response must be blanked and
+        the turn marked terminal_ack_tool — exactly like the empty-text case.
+        The reaction IS the response; the redundant text is suppressed.
+        """
+        self._setup_agent(agent)
+        agent.max_iterations = 10
+        agent.valid_tool_names = set(agent.valid_tool_names) | {"discord"}
+
+        react = _mock_tool_call(
+            name="discord",
+            arguments=(
+                '{"action": "react_to_message", "channel_id": "1", '
+                '"message_id": "2", "emoji": "✅"}'
+            ),
+            call_id="r1",
+        )
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[react])
+        # The model ALSO writes a redundant text reply this time.
+        resp2 = _mock_response(
+            content="Done — reminder set for 5 minutes.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                return_value='{"success": true, "message": "Reacted with ✅."}',
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("remind me in 5 minutes")
+
+        assert agent._reaction_emitted_this_turn is True
+        # Despite the model writing text, the DELIVERED response is blanked.
+        assert result["final_response"] == ""
+        assert result["turn_exit_reason"] == "terminal_ack_tool"
+        assert result["completed"] is True
+        assert result["failed"] is False
+
     def test_empty_without_reaction_still_nudges(self, agent):
         """An empty follow-up after a NON-reaction tool must still trigger
         the post-tool nudge (the existing safety net is preserved)."""

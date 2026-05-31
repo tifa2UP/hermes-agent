@@ -1908,3 +1908,112 @@ class TestUtf16OverflowDetection:
         # this file passing — they all use MagicMock adapters.
         assert consumer is not None
 
+
+# ── discard_sent: reaction-only ack suppression ───────────────────────────
+
+
+class TestDiscardSent:
+    """Verify ``discard_sent()`` deletes the streamed message, resets state,
+    and suppresses any subsequent send (used when a platform reaction became
+    the entire user-facing response this turn)."""
+
+    @pytest.mark.asyncio
+    async def test_discard_deletes_message_resets_and_suppresses(self):
+        """discard_sent() calls adapter.delete_message with the tracked
+        message_id, clears send-state, and latches _suppressed so a late
+        on_delta no-ops."""
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.delete_message = AsyncMock()
+        consumer = GatewayStreamConsumer(adapter, "chat_42")
+
+        # Simulate that streaming already sent a real message.
+        consumer._message_id = "msg_99"
+        consumer._already_sent = True
+        consumer._final_response_sent = True
+        consumer._final_content_delivered = True
+
+        await consumer.discard_sent()
+
+        # Deleted the tracked message.
+        adapter.delete_message.assert_awaited_once_with("chat_42", "msg_99")
+        # State reset so nothing downstream resends.
+        assert consumer._message_id is None
+        assert consumer.already_sent is False
+        assert consumer.final_response_sent is False
+        assert consumer.final_content_delivered is False
+        # Suppression latched.
+        assert consumer._suppressed is True
+
+        # A late delta must not re-queue text after discard.
+        consumer.on_delta("late text after discard")
+        assert consumer._queue.empty()
+        # finish() and on_commentary() also no-op.
+        consumer.finish()
+        consumer.on_commentary("late commentary")
+        assert consumer._queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_discard_no_message_id_is_noop_delete_but_suppresses(self):
+        """When nothing was sent yet, discard_sent() skips delete but still
+        latches suppression."""
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.delete_message = AsyncMock()
+        consumer = GatewayStreamConsumer(adapter, "chat_7")
+
+        await consumer.discard_sent()
+
+        adapter.delete_message.assert_not_awaited()
+        assert consumer._suppressed is True
+        assert consumer.already_sent is False
+
+    @pytest.mark.asyncio
+    async def test_discard_skips_no_edit_sentinel(self):
+        """The ``__no_edit__`` sentinel is not a real message id — discard
+        must not attempt to delete it."""
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.delete_message = AsyncMock()
+        consumer = GatewayStreamConsumer(adapter, "chat_7")
+        consumer._message_id = "__no_edit__"
+
+        await consumer.discard_sent()
+
+        adapter.delete_message.assert_not_awaited()
+        assert consumer._message_id is None
+        assert consumer._suppressed is True
+
+    @pytest.mark.asyncio
+    async def test_discard_swallows_delete_failure(self):
+        """A failing delete is best-effort — discard still resets state and
+        suppresses without raising."""
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.delete_message = AsyncMock(side_effect=RuntimeError("flood"))
+        consumer = GatewayStreamConsumer(adapter, "chat_7")
+        consumer._message_id = "msg_1"
+        consumer._already_sent = True
+
+        await consumer.discard_sent()  # must not raise
+
+        adapter.delete_message.assert_awaited_once()
+        assert consumer._message_id is None
+        assert consumer._suppressed is True
+
+    @pytest.mark.asyncio
+    async def test_discard_adapter_without_delete_message(self):
+        """Platforms that don't implement delete_message: discard still
+        resets state and suppresses (the streamed message just stays)."""
+        # spec=[] so getattr(adapter, "delete_message", None) returns None.
+        adapter = MagicMock(spec=["MAX_MESSAGE_LENGTH"])
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        consumer = GatewayStreamConsumer(adapter, "chat_7")
+        consumer._message_id = "msg_1"
+        consumer._already_sent = True
+
+        await consumer.discard_sent()  # must not raise
+
+        assert consumer._message_id is None
+        assert consumer._suppressed is True
+
