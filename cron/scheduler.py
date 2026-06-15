@@ -615,6 +615,42 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
+def _is_reminder_job(job: dict) -> bool:
+    """Whether *job* is a one-shot reminder (``schedule.kind == "once"``).
+
+    Reminders ("remind me to X") are one-shot cron jobs; recurring
+    interval/cron jobs are excluded. Used to decide whether to attach the
+    interactive Discord action buttons (Done / Snooze) on delivery.
+    """
+    schedule = job.get("schedule")
+    return isinstance(schedule, dict) and schedule.get("kind") == "once"
+
+
+def _reminder_send_metadata(job: dict, base: Optional[dict]) -> Optional[dict]:
+    """Augment *base* send-metadata with a reminder descriptor for Discord.
+
+    The Discord adapter reads ``metadata['reminder']`` to attach Mark-Done /
+    Snooze buttons and to persist the payload needed to re-create the reminder
+    when a snooze button is clicked (a one-shot reminder is deleted the moment
+    it fires, so snooze re-creates rather than reschedules). Other platforms
+    ignore the key.
+    """
+    try:
+        from cron.jobs import reminder_payload_from_job
+
+        descriptor = {
+            "job_id": job.get("id"),
+            "name": job.get("name"),
+            "payload": reminder_payload_from_job(job),
+        }
+    except Exception:
+        logger.debug("Failed to build reminder descriptor for job %s", job.get("id"), exc_info=True)
+        return base
+    meta = dict(base) if base else {}
+    meta["reminder"] = descriptor
+    return meta
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -717,6 +753,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
+            # Attach a reminder descriptor so the live Discord adapter can render
+            # native Mark-Done / Snooze buttons. Only for Discord one-shot
+            # reminders; the standalone (gateway-offline) path can't service
+            # button clicks, so buttons are intentionally live-path only.
+            if platform_name.lower() == "discord" and _is_reminder_job(job):
+                send_metadata = _reminder_send_metadata(job, send_metadata)
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
                 text_to_send = cleaned_delivery_content.strip()

@@ -169,10 +169,30 @@ def _ensure_discord_mock() -> None:
             self.description = description
     discord_mod.SelectOption = _FakeSelectOption
 
+    # ui.DynamicItem: minimal stand-in for discord.py's stateless dynamic
+    # component (2.4+) so adapters that define DynamicItem subclasses (e.g. the
+    # reminder action buttons) import and build views under the mock.
+    import re as _re
+
+    class _FakeDynamicItem:
+        def __init_subclass__(cls, *, template=None, **kw):
+            super().__init_subclass__(**kw)
+            cls.__discord_ui_compiled_template__ = (
+                _re.compile(template) if isinstance(template, str) else template
+            )
+
+        def __class_getitem__(cls, item):
+            return cls
+
+        def __init__(self, item):
+            self.item = item
+            self.custom_id = getattr(item, "custom_id", None)
+
     discord_mod.ui = SimpleNamespace(
         View=_FakeView,
         Select=_FakeSelect,
         Button=_FakeButton,
+        DynamicItem=_FakeDynamicItem,
         button=lambda *a, **k: (lambda fn: fn),
     )
     discord_mod.ButtonStyle = SimpleNamespace(

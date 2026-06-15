@@ -17975,6 +17975,35 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.error("Failed to send approval request: %s", _e)
 
+            # Web-search reaction bridge: when the agent runs a web search,
+            # add a 🌐 reaction to the user's message (reaction only, never a
+            # reply).  Only wired for adapters that support react_to_message
+            # (currently Discord).  Mirrors the approval/clarify notify bridge:
+            # the callback runs on the agent thread and schedules the adapter
+            # call on the bot's event loop.  Fires at most once per turn.
+            _web_search_reacted = [False]
+            _supports_search_reaction = bool(
+                _status_adapter is not None
+                and event_message_id
+                and getattr(type(_status_adapter), "react_to_message", None) is not None
+            )
+
+            def _web_search_reaction_notify() -> None:
+                if _web_search_reacted[0] or not _run_still_current():
+                    return
+                _web_search_reacted[0] = True
+                safe_schedule_threadsafe(
+                    _status_adapter.react_to_message(
+                        chat_id=_status_chat_id,
+                        message_id=str(event_message_id),
+                        emoji="🌐",
+                        metadata=_status_thread_metadata,
+                    ),
+                    _loop_for_step,
+                    logger=logger,
+                    log_message="web-search reaction failed to schedule",
+                )
+
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})
             _msn = _pending_notes.pop(session_key, None) if session_key else None
@@ -18067,6 +18096,9 @@ class GatewayRunner:
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
+            if _supports_search_reaction:
+                from tools.web_search_reaction import register_notify as _register_search_reaction
+                _register_search_reaction(session_id, _web_search_reaction_notify)
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
                 # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -18112,6 +18144,12 @@ class GatewayRunner:
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
+                if _supports_search_reaction:
+                    try:
+                        from tools.web_search_reaction import unregister_notify as _unregister_search_reaction
+                        _unregister_search_reaction(session_id)
+                    except Exception:
+                        pass
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
                 # completion, gateway shutdown).  Idempotent.

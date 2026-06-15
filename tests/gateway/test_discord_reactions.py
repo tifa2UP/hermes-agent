@@ -281,3 +281,61 @@ async def test_on_processing_complete_cancelled_removes_eyes_without_terminal_re
 
     raw_message.remove_reaction.assert_awaited_once_with("👀", adapter._client.user)
     raw_message.add_reaction.assert_not_awaited()
+
+
+# ── react_to_message (web-search reaction bridge) ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_react_to_message_adds_reaction(adapter):
+    target = SimpleNamespace(add_reaction=AsyncMock())
+    channel = SimpleNamespace(fetch_message=AsyncMock(return_value=target))
+    adapter._client.get_channel = lambda _id: channel
+
+    ok = await adapter.react_to_message(chat_id="123", message_id="55", emoji="🌐")
+
+    assert ok is True
+    channel.fetch_message.assert_awaited_once_with(55)
+    target.add_reaction.assert_awaited_once_with("🌐")
+
+
+@pytest.mark.asyncio
+async def test_react_to_message_prefers_thread_metadata(adapter):
+    target = SimpleNamespace(add_reaction=AsyncMock())
+    channel = SimpleNamespace(fetch_message=AsyncMock(return_value=target))
+    seen_ids = []
+
+    def _get_channel(_id):
+        seen_ids.append(_id)
+        return channel
+
+    adapter._client.get_channel = _get_channel
+
+    ok = await adapter.react_to_message(
+        chat_id="123", message_id="55", emoji="🌐", metadata={"thread_id": "777"}
+    )
+
+    assert ok is True
+    assert seen_ids == [777]  # thread_id wins over chat_id
+
+
+@pytest.mark.asyncio
+async def test_react_to_message_disabled_via_env(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REACTIONS", "false")
+    channel = SimpleNamespace(fetch_message=AsyncMock())
+    adapter._client.get_channel = lambda _id: channel
+
+    ok = await adapter.react_to_message(chat_id="123", message_id="55", emoji="🌐")
+
+    assert ok is False
+    channel.fetch_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_react_to_message_swallows_errors(adapter):
+    channel = SimpleNamespace(fetch_message=AsyncMock(side_effect=RuntimeError("boom")))
+    adapter._client.get_channel = lambda _id: channel
+
+    ok = await adapter.react_to_message(chat_id="123", message_id="55", emoji="🌐")
+
+    assert ok is False

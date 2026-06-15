@@ -51,7 +51,7 @@ from gateway.config import Platform, PlatformConfig
 import re
 
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
-from utils import atomic_json_write
+from utils import atomic_json_write, is_truthy_value
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -620,6 +620,60 @@ class DiscordAdapter(BasePlatformAdapter):
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
         self._last_self_message_id: Dict[str, str] = {}
+        # Reminder action buttons (Mark Done / Snooze) on delivered one-shot
+        # cron reminders. On by default; disable via reminder_buttons: false in
+        # the discord config block or HERMES_DISCORD_REMINDER_BUTTONS=0.
+        _reminder_default = bool(self.config.extra.get("reminder_buttons", True))
+        _reminder_env = os.getenv("HERMES_DISCORD_REMINDER_BUTTONS")
+        self._reminder_buttons: bool = (
+            is_truthy_value(_reminder_env, default=_reminder_default)
+            if _reminder_env is not None
+            else _reminder_default
+        )
+        self._reminder_store = None  # lazy ReminderActionStore (see _get_reminder_store)
+
+    def _get_reminder_store(self):
+        """Lazily build the disk-backed reminder-action store."""
+        if self._reminder_store is None:
+            from .reminder_actions import ReminderActionStore
+
+            self._reminder_store = ReminderActionStore()
+        return self._reminder_store
+
+    def _make_reminder_view(self, reminder, chat_id, thread_id):
+        """Build a reminder-action button View and its pending store entry.
+
+        *reminder* is the descriptor the scheduler put in send-metadata
+        (``job_id`` / ``name`` / ``payload``). Returns ``(view, token, entry)``
+        where *entry* holds everything needed to act on the reminder later
+        (re-create it on snooze, identify it on done). The caller persists
+        *entry* only AFTER the message is sent (see ``send``) so a failed send
+        leaves no orphan store entry. Returns ``(None, None, None)`` when buttons
+        are disabled or the descriptor/view can't be built.
+        """
+        if not self._reminder_buttons or not reminder or not DISCORD_AVAILABLE:
+            return (None, None, None)
+        builder = globals().get("build_reminder_action_view")
+        if builder is None:
+            return (None, None, None)
+        try:
+            from .reminder_actions import new_token
+
+            token = new_token()
+            view = builder(token)
+            if view is None:
+                return (None, None, None)
+            entry = {
+                "job_id": reminder.get("job_id"),
+                "name": reminder.get("name"),
+                "payload": reminder.get("payload") or {},
+                "channel_id": str(chat_id),
+                "thread_id": str(thread_id) if thread_id else None,
+            }
+            return (view, token, entry)
+        except Exception:
+            logger.debug("[%s] Failed to build reminder action view", self.name, exc_info=True)
+            return (None, None, None)
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -734,6 +788,22 @@ class DiscordAdapter(BasePlatformAdapter):
                 **proxy_kwargs_for_bot(proxy_url),
             )
             adapter_self = self  # capture for closure
+
+            # Cross-reference so the stateless reminder-button interaction
+            # handlers (dynamic items) can reach this adapter for authorization
+            # and the disk-backed action store.
+            self._client._hermes_discord_adapter = self
+            # Register the persistent reminder-action buttons. discord.py then
+            # routes any matching click back to ReminderActionButton.callback —
+            # including on reminder messages sent before this (re)connect.
+            _reminder_button_cls = globals().get("ReminderActionButton")
+            if self._reminder_buttons and _reminder_button_cls is not None:
+                try:
+                    self._client.add_dynamic_items(_reminder_button_cls)
+                except Exception:
+                    logger.debug(
+                        "[%s] Failed to register reminder dynamic items", self.name, exc_info=True
+                    )
 
             # Register event handlers
             @self._client.event
@@ -1382,6 +1452,38 @@ class DiscordAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+    async def react_to_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        emoji: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Add an emoji reaction to a message identified by chat_id + message_id.
+
+        Used by the gateway web-search reaction bridge (sync agent thread →
+        bot loop) so a 🌐 reaction lands on the user's message while a web
+        search runs.  Reaction only — never a reply.  Honors the
+        ``DISCORD_REACTIONS`` toggle and resolves thread channels from
+        ``metadata`` the same way :meth:`send` does (thread_id takes
+        precedence over the parent chat_id).
+        """
+        if not self._reactions_enabled() or not self._client or not message_id:
+            return False
+        try:
+            thread_id = metadata.get("thread_id") if metadata else None
+            target_id = int(thread_id) if thread_id else int(chat_id)
+            channel = self._client.get_channel(target_id)
+            if not channel:
+                channel = await self._client.fetch_channel(target_id)
+            if not channel:
+                return False
+            message = await channel.fetch_message(int(message_id))
+            return await self._add_reaction(message, emoji)
+        except Exception as e:
+            logger.debug("[%s] react_to_message failed (%s): %s", self.name, emoji, e)
+            return False
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction for normal Discord message events."""
         if not self._reactions_enabled():
@@ -1462,15 +1564,30 @@ class DiscordAdapter(BasePlatformAdapter):
                 except Exception as e:
                     logger.debug("Could not fetch reply-to message: %s", e)
 
+            # Reminder action buttons (Mark Done / Snooze) attach to the LAST
+            # chunk so they sit beneath the full reminder text. The store entry
+            # is persisted only after a successful send (below) to avoid orphans.
+            reminder_descriptor = metadata.get("reminder") if metadata else None
+            reminder_view = reminder_token = reminder_entry = None
+            if reminder_descriptor:
+                reminder_view, reminder_token, reminder_entry = self._make_reminder_view(
+                    reminder_descriptor, chat_id, thread_id
+                )
+            last_index = len(chunks) - 1
+
             for i, chunk in enumerate(chunks):
                 if self._reply_to_mode == "all":
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+                extra_kwargs = {}
+                if reminder_view is not None and i == last_index:
+                    extra_kwargs["view"] = reminder_view
                 try:
                     msg = await channel.send(
                         content=chunk,
                         reference=chunk_reference,
+                        **extra_kwargs,
                     )
                 except Exception as e:
                     err_text = str(e)
@@ -1493,10 +1610,22 @@ class DiscordAdapter(BasePlatformAdapter):
                         msg = await channel.send(
                             content=chunk,
                             reference=None,
+                            **extra_kwargs,
                         )
                     else:
                         raise
                 message_ids.append(str(msg.id))
+
+            # Persist the reminder-action token only now that the message
+            # carrying the buttons was sent — a failed send above raises before
+            # this, so the disk-backed store never accrues orphan entries.
+            if reminder_token and message_ids:
+                try:
+                    self._get_reminder_store().put(reminder_token, reminder_entry)
+                except Exception:
+                    logger.debug(
+                        "[%s] Failed to persist reminder action token", self.name, exc_info=True
+                    )
 
             # Track the last message we sent in this channel for history
             # backfill — avoids a full channel.history() scan on hot paths.
@@ -5030,6 +5159,123 @@ def _component_check_auth(
     return False
 
 
+def _reminder_button_meta() -> Dict[str, tuple]:
+    """Map reminder action key -> (label, emoji) for button rendering."""
+    from .reminder_actions import BUTTON_SPECS
+
+    return {action: (label, emoji) for action, label, emoji in BUTTON_SPECS}
+
+
+async def _handle_reminder_click(interaction, token: str, action: str) -> None:
+    """Service a click on a reminder action button (Done / Snooze).
+
+    Stateless w.r.t. the originating View: everything is reconstructed from the
+    ``token`` via the disk-backed store, so a click works even hours later or
+    after a gateway restart. Authorization mirrors the other component views
+    (``_component_check_auth`` against the adapter's user/role allowlists).
+    """
+    from .reminder_actions import (
+        ACTION_DONE,
+        mark_reminder_done,
+        recreate_reminder,
+        snooze_label,
+        SNOOZE_MINUTES,
+    )
+
+    adapter = getattr(getattr(interaction, "client", None), "_hermes_discord_adapter", None)
+    if adapter is None:
+        # Can't resolve the adapter's trust boundary (the user/role allowlists),
+        # so fail closed — never treat "no adapter" as "no allowlist = allow
+        # everyone". In practice the back-ref is set in connect() before the
+        # dynamic items are registered, so this only guards against races.
+        try:
+            await interaction.response.send_message(
+                "Reminder controls are unavailable right now~", ephemeral=True,
+            )
+        except Exception:
+            logger.debug("Reminder no-adapter response failed", exc_info=True)
+        return
+    if not _component_check_auth(interaction, adapter._allowed_user_ids, adapter._allowed_role_ids):
+        try:
+            await interaction.response.send_message(
+                "You're not authorized to act on this reminder~", ephemeral=True,
+            )
+        except Exception:
+            logger.debug("Reminder auth-reject response failed", exc_info=True)
+        return
+
+    store = adapter._get_reminder_store()
+    entry = store.get(token)
+    if entry is None:
+        # Already resolved, evicted, or from a different install — drop the
+        # now-dead buttons so the message stops inviting clicks.
+        try:
+            await interaction.response.edit_message(view=None)
+        except Exception:
+            try:
+                await interaction.response.send_message(
+                    "This reminder is no longer active~", ephemeral=True,
+                )
+            except Exception:
+                logger.debug("Reminder stale-token response failed", exc_info=True)
+        return
+
+    user = getattr(interaction, "user", None)
+    who = (getattr(user, "display_name", None) or getattr(user, "name", None) or "you")
+    who = str(who)[:80]  # bound the status line; Discord names are short but be safe
+
+    try:
+        if action == ACTION_DONE:
+            mark_reminder_done(entry.get("job_id"))
+            store.remove(token)
+            status = f"✅ Marked done by {who}"
+        else:
+            minutes = SNOOZE_MINUTES.get(action)
+            if minutes is None:
+                await interaction.response.send_message(
+                    "Unknown snooze option~", ephemeral=True,
+                )
+                return
+            label = snooze_label(minutes)
+            try:
+                recreate_reminder(entry.get("payload") or {}, minutes)
+            except Exception:
+                logger.error("Failed to recreate snoozed reminder (token=%s)", token, exc_info=True)
+                await interaction.response.send_message(
+                    "Couldn't snooze that reminder — please re-create it manually~",
+                    ephemeral=True,
+                )
+                return
+            store.remove(token)
+            status = f"💤 Snoozed by {who} — I'll remind you again in {label}"
+    except Exception:
+        logger.error("Reminder action '%s' failed (token=%s)", action, token, exc_info=True)
+        try:
+            await interaction.response.send_message(
+                "Something went wrong handling that reminder~", ephemeral=True,
+            )
+        except Exception:
+            logger.debug("Reminder error response failed", exc_info=True)
+        return
+
+    # Acknowledge by removing the buttons and appending a status line (length
+    # permitting — Discord caps message content at 2000 chars).
+    content = getattr(getattr(interaction, "message", None), "content", "") or ""
+    suffix = f"\n\n— {status}"
+    try:
+        if len(content) + len(suffix) <= 2000:
+            await interaction.response.edit_message(content=content + suffix, view=None)
+        else:
+            await interaction.response.edit_message(view=None)
+            await interaction.followup.send(status, ephemeral=False)
+    except Exception:
+        logger.debug("Reminder edit_message failed (token=%s)", token, exc_info=True)
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
+
+
 def _define_discord_view_classes() -> None:
     """Register Discord UI view classes as module globals.
 
@@ -5041,6 +5287,7 @@ def _define_discord_view_classes() -> None:
     undefined, causing NameError on the first button interaction.
     """
     global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView
+    global ReminderActionButton
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -5740,6 +5987,79 @@ def _define_discord_view_classes() -> None:
             self.resolved = True
             for child in self.children:
                 child.disabled = True
+
+    from .reminder_actions import ACTION_DONE, CUSTOM_ID_TEMPLATE, build_custom_id
+
+    _reminder_meta = _reminder_button_meta()
+
+    # discord.ui.DynamicItem (2.4+) gives stateless, restart-surviving routing
+    # for buttons with dynamic custom_ids. Guard for older/mocked discord
+    # builds without it — the adapter must still import (reminders then deliver
+    # without buttons).
+    if hasattr(discord.ui, "DynamicItem"):
+
+        class ReminderActionButton(
+            discord.ui.DynamicItem[discord.ui.Button],
+            template=CUSTOM_ID_TEMPLATE,
+        ):
+            """Persistent reminder action button (Mark Done / Snooze 15m·1h·6h·24h).
+
+            Registered once via ``bot.add_dynamic_items``; discord.py routes any
+            click whose ``custom_id`` matches the template back to ``callback`` —
+            even on messages sent before the most recent restart. State lives in
+            the disk-backed ``ReminderActionStore`` keyed by the token in the
+            custom_id, so the View object itself need not survive (timeout=None,
+            no add_view).
+            """
+
+            def __init__(self, token: str, action: str):
+                self.token = token
+                self.action = action
+                label, emoji = _reminder_meta.get(action, (action, None))
+                style = (
+                    discord.ButtonStyle.success
+                    if action == ACTION_DONE
+                    else discord.ButtonStyle.secondary
+                )
+                super().__init__(
+                    discord.ui.Button(
+                        label=label,
+                        style=style,
+                        emoji=emoji,
+                        custom_id=build_custom_id(token, action),
+                    )
+                )
+
+            @classmethod
+            async def from_custom_id(cls, interaction, item, match, /):
+                return cls(match["token"], match["action"])
+
+            async def callback(self, interaction):
+                await _handle_reminder_click(interaction, self.token, self.action)
+
+    else:
+        ReminderActionButton = None
+
+
+def build_reminder_action_view(token: str):
+    """Build a persistent View carrying the reminder action buttons for *token*.
+
+    ``timeout=None`` keeps the buttons enabled indefinitely; click routing is
+    handled by the registered ``ReminderActionButton`` dynamic item, so the View
+    need not be retained in memory. Returns ``None`` when dynamic items are
+    unavailable (older/mocked discord).
+    """
+    button_cls = globals().get("ReminderActionButton")
+    if button_cls is None:
+        return None
+    from .reminder_actions import BUTTON_SPECS
+
+    view = discord.ui.View(timeout=None)
+    for action, _label, _emoji in BUTTON_SPECS:
+        view.add_item(button_cls(token, action))
+    return view
+
+
 if DISCORD_AVAILABLE:
     _define_discord_view_classes()
 
@@ -6246,3 +6566,13 @@ def register(ctx) -> None:
         emoji="🎮",
         allow_update_command=True,
     )
+
+    # Web-search reaction bridge: add a 🌐 reaction to the triggering message
+    # while a web search runs (reaction only, never a reply).  The hook is a
+    # no-op unless the gateway registered a per-session callback for the
+    # running task_id (see tools.web_search_reaction + gateway/run.py).
+    try:
+        from tools.web_search_reaction import pre_tool_call as _web_search_reaction_hook
+        ctx.register_hook("pre_tool_call", _web_search_reaction_hook)
+    except Exception as _hook_err:  # pragma: no cover - defensive
+        logger.debug("Failed to register web-search reaction hook: %s", _hook_err)

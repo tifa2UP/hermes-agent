@@ -712,6 +712,44 @@ def create_job(
     return job
 
 
+# Job fields that, together with a fresh schedule, reproduce a job via
+# ``create_job``. Used to "snooze" a reminder: a one-shot reminder is deleted
+# the moment it fires (see ``mark_job_run``), so snoozing re-creates an
+# equivalent one-shot rather than rescheduling a now-deleted job id.
+_REMINDER_RECREATE_FIELDS = (
+    "prompt",
+    "name",
+    "deliver",
+    "origin",
+    "skills",
+    "model",
+    "provider",
+    "base_url",
+    "script",
+    "context_from",
+    "enabled_toolsets",
+    "workdir",
+    "profile",
+    "no_agent",
+)
+
+
+def reminder_payload_from_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the JSON-serializable ``create_job`` kwargs that reproduce *job*.
+
+    Excludes ``schedule`` and ``repeat`` so the caller supplies a fresh
+    one-shot schedule (e.g. ``"15m"``) when re-creating a snoozed reminder.
+    Faithfully carries the prompt, skills, model/provider, script, delivery
+    target (``deliver``/``origin``), and runtime context (workdir/profile/
+    toolsets) so the snoozed reminder fires exactly as the original did.
+    """
+    payload: Dict[str, Any] = {}
+    for field in _REMINDER_RECREATE_FIELDS:
+        if field in job:
+            payload[field] = job[field]
+    return payload
+
+
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Get a job by ID."""
     jobs = load_jobs()
